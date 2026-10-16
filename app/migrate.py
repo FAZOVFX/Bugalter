@@ -1,21 +1,70 @@
 import asyncio
+from typing import NamedTuple
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.database import Base, engine
 from app.logsafe import safe_db_message, scrub
 
 # Mavjud jadvallar va yozuvlar saqlanadi. DROP, TRUNCATE va drop_all ishlatilmaydi.
+#
+# Eski bazada ba'zi ustunlar yo'q. ALTER COLUMN ... SET DEFAULT shunday ustunga
+# tegsa, PostgreSQL "column does not exist" bilan to'xtaydi. Avval haqiqiy
+# ustunlar tekshiriladi, yo'q bo'lsa modeldagi tur bilan qo'shiladi va shundan
+# keyingina DEFAULT o'rnatiladi.
+
+
+class ColumnDefault(NamedTuple):
+    table: str
+    column: str
+    column_type: str
+    default_sql: str
+    alter_existing_type: bool = False
+
+
+# Model bilan bir xil tur va dastur ishlatadigan bo'sh/standart qiymat.
+COLUMN_DEFAULTS = (
+    ColumnDefault("orders", "phone", "VARCHAR(40)", "''", alter_existing_type=True),
+    ColumnDefault(
+        "orders",
+        "paid_amount",
+        "NUMERIC(14, 2)",
+        "0",
+        alter_existing_type=True,
+    ),
+    ColumnDefault(
+        "orders",
+        "service",
+        "VARCHAR(500)",
+        "''",
+        alter_existing_type=True,
+    ),
+    ColumnDefault("orders", "status", "VARCHAR(30)", "'Yangi'"),
+    ColumnDefault("orders", "notes", "TEXT", "''"),
+    ColumnDefault("payments", "method", "VARCHAR(40)", "'Naqd'"),
+    ColumnDefault("payments", "note", "TEXT", "''"),
+    ColumnDefault("expenses", "description", "TEXT", "''"),
+    ColumnDefault("team_members", "role", "VARCHAR(120)", "'Xodim'"),
+    ColumnDefault("team_members", "active", "BOOLEAN", "true"),
+    ColumnDefault("team_payments", "note", "TEXT", "''"),
+)
+
+TYPE_IF_PRESENT = (
+    ("orders", "total_price", "NUMERIC(14, 2)"),
+)
+
+_IDENTIFIERS = frozenset(
+    name
+    for spec in COLUMN_DEFAULTS
+    for name in (spec.table, spec.column)
+) | {"orders", "total_price"}
+_TYPES = frozenset(spec.column_type for spec in COLUMN_DEFAULTS) | {
+    "NUMERIC(14, 2)",
+}
+_DEFAULTS = frozenset(spec.default_sql for spec in COLUMN_DEFAULTS)
+
 STATEMENTS = (
-    "ALTER TABLE orders ALTER COLUMN phone TYPE VARCHAR(40)",
-    "ALTER TABLE orders ALTER COLUMN total_price TYPE NUMERIC(14, 2)",
-    "ALTER TABLE orders ALTER COLUMN paid_amount TYPE NUMERIC(14, 2)",
-    "ALTER TABLE orders ALTER COLUMN phone SET DEFAULT ''",
-    "ALTER TABLE orders ALTER COLUMN service SET DEFAULT ''",
-    "ALTER TABLE orders ALTER COLUMN service TYPE VARCHAR(500)",
-    "ALTER TABLE orders ALTER COLUMN status SET DEFAULT 'Yangi'",
-    "ALTER TABLE orders ALTER COLUMN paid_amount SET DEFAULT 0",
-    "ALTER TABLE orders ALTER COLUMN notes SET DEFAULT ''",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS event_checked_on DATE",
     """
     UPDATE orders
@@ -33,20 +82,14 @@ STATEMENTS = (
     SET order_number = 'FCG-' || LPAD(id::text, 5, '0')
     WHERE order_number IS NULL OR order_number = ''
     """,
-    "ALTER TABLE payments ALTER COLUMN method SET DEFAULT 'Naqd'",
-    "ALTER TABLE payments ALTER COLUMN note SET DEFAULT ''",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(64)",
     "CREATE UNIQUE INDEX IF NOT EXISTS payments_idempotency_key_key ON payments (idempotency_key)",
     "CREATE INDEX IF NOT EXISTS ix_payments_order_id ON payments (order_id)",
     "CREATE INDEX IF NOT EXISTS ix_payments_paid_at ON payments (paid_at)",
-    "ALTER TABLE expenses ALTER COLUMN description SET DEFAULT ''",
     "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(64)",
     "CREATE UNIQUE INDEX IF NOT EXISTS expenses_idempotency_key_key ON expenses (idempotency_key)",
     "CREATE INDEX IF NOT EXISTS ix_expenses_spent_at ON expenses (spent_at)",
-    "ALTER TABLE team_members ALTER COLUMN role SET DEFAULT 'Xodim'",
     "ALTER TABLE team_members ADD COLUMN IF NOT EXISTS phone VARCHAR(40) NOT NULL DEFAULT ''",
-    "ALTER TABLE team_members ALTER COLUMN active SET DEFAULT true",
-    "ALTER TABLE team_payments ALTER COLUMN note SET DEFAULT ''",
     "ALTER TABLE team_payments ADD COLUMN IF NOT EXISTS work_for VARCHAR(200) NOT NULL DEFAULT ''",
     "ALTER TABLE team_payments ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(64)",
     "ALTER TABLE team_payments ADD COLUMN IF NOT EXISTS debt_id INTEGER REFERENCES team_debts(id)",
@@ -73,9 +116,100 @@ STATEMENTS = (
 )
 
 
+def _checked_name(name: str) -> str:
+    if name not in _IDENTIFIERS:
+        raise ValueError(name)
+    return name
+
+
+async def table_columns(connection: AsyncConnection, table: str) -> set[str]:
+    """Jadvalning hozirgi ustunlari. Qidiruv yo'lidagi haqiqiy jadval olinadi."""
+    checked = _checked_name(table)
+    result = await connection.execute(
+        text(
+            """
+            SELECT attribute.attname
+            FROM pg_catalog.pg_attribute AS attribute
+            WHERE attribute.attrelid = to_regclass(CAST(:table_name AS text))
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            """
+        ),
+        {"table_name": checked},
+    )
+    return {str(row[0]) for row in result}
+
+
+async def ensure_column_default(
+    connection: AsyncConnection,
+    spec: ColumnDefault,
+) -> None:
+    """Ustun yo'q bo'lsa qo'shadi, mavjud bo'lgach DEFAULT o'rnatadi.
+
+    Eski yozuvlar o'chirilmaydi. Yangi ustundagi NULL qiymatlar modeldagi
+    standartga to'ldiriladi, so'ng NOT NULL qo'yiladi.
+    """
+    table = _checked_name(spec.table)
+    column = _checked_name(spec.column)
+    if spec.column_type not in _TYPES or spec.default_sql not in _DEFAULTS:
+        raise ValueError(spec.column)
+    columns = await table_columns(connection, table)
+    if column not in columns:
+        await connection.execute(
+            text(f"ALTER TABLE {table} ADD COLUMN {column} {spec.column_type}")
+        )
+    elif spec.alter_existing_type:
+        await connection.execute(
+            text(
+                f"ALTER TABLE {table} ALTER COLUMN {column} TYPE {spec.column_type}"
+            )
+        )
+    await connection.execute(
+        text(f"ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {spec.default_sql}")
+    )
+    await connection.execute(
+        text(
+            f"UPDATE {table} SET {column} = {spec.default_sql} "
+            f"WHERE {column} IS NULL"
+        )
+    )
+    await connection.execute(
+        text(f"ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL")
+    )
+
+
+async def alter_type_if_present(
+    connection: AsyncConnection,
+    table: str,
+    column: str,
+    column_type: str,
+) -> None:
+    checked_table = _checked_name(table)
+    checked_column = _checked_name(column)
+    if column_type not in _TYPES:
+        raise ValueError(column_type)
+    columns = await table_columns(connection, checked_table)
+    if checked_column not in columns:
+        return
+    await connection.execute(
+        text(
+            "ALTER TABLE "
+            f"{checked_table} ALTER COLUMN {checked_column} TYPE {column_type}"
+        )
+    )
+
+
+async def apply_column_repairs(connection: AsyncConnection) -> None:
+    for table, column, column_type in TYPE_IF_PRESENT:
+        await alter_type_if_present(connection, table, column, column_type)
+    for spec in COLUMN_DEFAULTS:
+        await ensure_column_default(connection, spec)
+
+
 async def migrate_schema() -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await apply_column_repairs(connection)
         for statement in STATEMENTS:
             await connection.execute(text(statement))
 
